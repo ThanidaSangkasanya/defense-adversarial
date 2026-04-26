@@ -1,303 +1,314 @@
-import os
-import torch
+"""
+get_cloak.py — Apply Universal Cloak & Evaluate (v2)
+ปรับปรุง:
+- apply noise บน original size image
+- save ภาพ original size พร้อม bounding box ทุกโมเดล
+- รองรับ yolov5n, nanodet, rtdetr และ 4 เกม
+
+Usage:
+    python get_cloak.py --game cs2 --model yolov5n
+"""
+
+import os, sys, time, argparse
 import numpy as np
-from PIL import Image
-from utils.dataset import load_dataset
-import time
-import shutil
-from tqdm import tqdm
-from loguru import logger
-import argparse
-from pytorch_msssim import ssim
-import imageio
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from pytorch_msssim import ssim as ssim_fn
+import pandas as pd
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
-parser = argparse.ArgumentParser(
-    description='Invisibility Cloak',
-    formatter_class=argparse.RawTextHelpFormatter
-)
-# parser.add_argument('--game', default='cs2', type=str,
-#                     help='Choose dataset from cs2 or cf (default: cs2).')
-parser.add_argument('--n_iter', default=5, type=int,
-                    help='The number of iterations (default: 5).')
-parser.add_argument('--lr', default=0.005, type=float,
-                    help='Learning rate (default: 0.005).')
-parser.add_argument('--epsilon', default=8, type=int,
-                    help='The L_infinity norm constraint, input value 8 represents 8/255 (default: 8).')
-parser.add_argument('--local_model', default='yolov5n', type=str, choices=['yolov5n','yolov5s','yolov5m'],
-                    help='Choose local proxy model (default: yolov5n).')
-parser.add_argument('--target_model', default='yolov5n', type=str, choices=['yolov5n','yolov5s','yolov5m'],
-                    help='Choose target cheating model to defend (default: yolov5n).')
-parser.add_argument('--gpu', default='0', type=str,
-                    help='GPU device to use for computation (default: "0").')
-parser.add_argument('--use_universal_cloak', default=1, type=int,
-                    help='Flag to determine whether to use Universal Cloak (default: 1). Set to 1 to use Universal Cloak, set to 0 to not use it.')
-parser.add_argument('--visualize_gif', default=0, type=int,
-                    help='Flag to determine whether to generate a GIF (default: 0). Set to 1 to generate a GIF, set to 0 to not generate it.')
-parser.add_argument('--scenario', default='stand', type=str, 
-                    choices=['2people', 'back', 'cover', 'fire', 'flash', 'football',
-                             'halfbody', 'hited', 'jump', 'knife', 'op', 'props', 'reload',
-                             'run', 'side', 'smoke', 'stand', 'usingprop'],
-                    help='Choose a scenario for the cs2 demo. Options include:\n'
-                         '2people: Scenario with two people present.\n'
-                         'back: Scenario where the character is facing backwards.\n'
-                         'cover: Scenario where the character is behind cover.\n'
-                         'fire: Scenario where the character is firing a weapon.\n'
-                         'flash: Scenario involving a flash effect.\n'
-                         'football: Scenario with a football next to the character.\n'
-                         'halfbody: Scenario showing half of the character\'s body.\n'
-                         'hited: Scenario where the character is hit.\n'
-                         'jump: Scenario where the character is jumping.\n'
-                         'knife: Scenario where the character is holding a knife.\n'
-                         'op: Scenario where the character is holding a sniper.\n'
-                         'props: Scenario where the character is hurt by a prop.\n'
-                         'reload: Scenario where the character is reloading a weapon.\n'
-                         'run: Scenario where the character is running.\n'
-                         'side: Scenario showing a side view of the character.\n'
-                         'smoke: Scenario involving smoke.\n'
-                         'stand: Scenario where the character is standing.\n'
-                         'usingprop: Scenario where the character is using a prop.\n'
-                         '(default: stand).')
-
+# ─── ARGUMENTS ───────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument('--game',    required=True, type=str,
+                    choices=['cs2','cf','valorant','overwatch'])
+parser.add_argument('--model',   required=True, type=str,
+                    choices=['yolov5n','nanodet','rtdetr'])
+parser.add_argument('--epsilon', default=8,    type=int)
+parser.add_argument('--conf',    default=0.4,  type=float)
+parser.add_argument('--gpu',     default='0',  type=str)
 args = parser.parse_args()
-device = 'cuda:' + args.gpu
-BCEobj = torch.nn.BCELoss()
-BCElogits = torch.nn.BCEWithLogitsLoss()
-gt_conf = torch.zeros((1, 63000, 1),device=device)
-gt_conf_nano = torch.zeros((1, 21250),device=device)
-global_noise = None
-# if args.game == 'cf':
-#     global_noise_path = 'universal_cloak/cf/yolov5n_yolov5s_yolov5m/Best-Succ-0.9143-BS-16-LR-0.001.pt'
-# elif args.game == 'cs2':
-global_noise_path = 'universal_cloak/cs2/yolov5n_yolov5s_yolov5m/Best-Succ-0.84-BS-16-LR-0.001.pt'
-if args.use_universal_cloak == 1:
-    print("We are using the Universal Cloak.")
-    global_noise = torch.load(global_noise_path).to(device)
 
-class FindNoise(torch.nn.Module):
-    def __init__(self, model,epsilon,noise):
-        super(FindNoise,self).__init__()
-        self.model = model
-        self.epsilon = epsilon
-        self.noise = noise
-        self.noise.requires_grad = True
+DEVICE = f'cuda:{args.gpu}'
+EPS    = args.epsilon / 255.0
+GAME   = args.game
+MODEL  = args.model
 
-    def forward(self,input):
-        noise = torch.clamp(self.noise, -self.epsilon, self.epsilon) 
-        adv_img = torch.clamp(input + noise, 0.0, 1.0) 
-        preds = self.model(adv_img) 
-        return preds 
-    def get_adv(self,input):
-        with torch.no_grad():
-            noise = torch.clamp(self.noise, -self.epsilon, self.epsilon) 
-            adv_img = torch.clamp(input + noise, 0.0, 1.0) 
-        return adv_img
+MODEL_SIZE  = {'yolov5n':416, 'nanodet':320, 'rtdetr':640}
+MODEL_INPUT = MODEL_SIZE[MODEL]
 
+GAME_FOLDER = {'cs2':'CS2','cf':'CF','valorant':'Valorant','overwatch':'Overwatch'}
+DATA_PATH   = os.path.join(r'C:\Users\tsang\Dataset', GAME_FOLDER[GAME])
+NOISE_PATH  = os.path.join('universal_cloak', GAME, MODEL, 'universal_noise.pt')
 
-def xywh2xyxy(x):
-    # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-    y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
-    y[..., 1] = x[..., 1] - x[..., 3] / 2  # top left y
-    y[..., 2] = x[..., 0] + x[..., 2] / 2  # bottom rightog_vanishingt x
-    y[..., 3] = x[..., 1] + x[..., 3] / 2  # bottom right y
-    return y
+ATTACK_DIR  = os.path.join('result','evaluation', GAME, MODEL, 'attack')
+LOG_DIR     = os.path.join('result','log', GAME)
+os.makedirs(ATTACK_DIR, exist_ok=True)
+os.makedirs(LOG_DIR,    exist_ok=True)
+
+EVAL_XLSX = os.path.join('result','evaluation_summary.xlsx')
+EVAL_PNG  = os.path.join('result','evaluation_summary.png')
+
+print(f"\n{'='*55}")
+print(f"  Game  : {GAME}  |  Model : {MODEL}")
+print(f"  Data  : {DATA_PATH}")
+print(f"  Noise : {NOISE_PATH}")
+print(f"{'='*55}\n")
+
+# Load noise (model input size)
+if not os.path.exists(NOISE_PATH):
+    raise FileNotFoundError(f"Noise not found: {NOISE_PATH}\nRun train_cloak.py first.")
+noise_model_size = torch.load(NOISE_PATH).to(DEVICE)   # (3, S, S)
+print(f"  Noise loaded: {noise_model_size.shape}")
 
 
-def attack_success(preds,conf_thres=0.4):
-    preds = preds.detach()
-    xc = preds[..., 4] > 0.25  # candidates
+# ─── HELPERS ─────────────────────────────────────────────────
+def load_image_paths(folder):
+    exts  = ('.jpg','.jpeg','.png','.bmp')
+    paths = sorted([os.path.join(folder,f) for f in os.listdir(folder)
+                    if f.lower().endswith(exts)])
+    if not paths:
+        raise FileNotFoundError(f"No images in {folder}")
+    print(f"  Found {len(paths)} images")
+    return paths
 
-    x = preds[0][xc[0]]  # confidence
-    # Compute conf
-    x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
-    # Box/Mask
-    box = xywh2xyxy(x[:, :4])  # center_x, center_y, width, height) to (x1, y1, x2, y2)
-    mask = x[:, 85:]  # zero columns if no masks
-    # Detections matrix nx6 (xyxy, conf, cls)
-    conf, j = x[:, 5:85].max(1, keepdim=True)
-    x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
-    # Filter by class
-    x = x[(x[:, 5:6] == torch.tensor(0, device=x.device)).any(1)]
-    count = x.shape[0]
-    return count
+def apply_noise_original(img_pil):
+    """
+    img_pil: PIL RGB original size
+    1. resize to model input → apply noise → resize noise back → add to original
+    Returns: adv PIL image (original size), adv tensor (1,3,H,W)
+    """
+    orig_w, orig_h = img_pil.size
+    img_t = torch.from_numpy(
+        np.array(img_pil).transpose(2,0,1)).float().unsqueeze(0).to(DEVICE) / 255.0
 
-def tog_vanishing(x,model,n_iter=3, eps=8/255., lr=0.001):
-    t_start = time.time()
-    succ = 0
-    query = 0
-    x = x.clone()
-    # test global noise
-    with torch.no_grad():
-        if not global_noise is None:
-            eta = torch.clamp(global_noise,-eps,eps)
-            x_adv = torch.clamp(x + eta, 0.0, 1.0)
-            preds = model(x_adv)
-            query += 1
-            result = attack_success(preds)
-            if result == 0: # attack success
-                succ = 1
-                t = time.time() - t_start
-                return x_adv,query,succ,t
-            else:
-                eta = global_noise.clone()
-        else:
-            eta = torch.rand((x.shape),device=device).mul(2*eps).sub(eps)
+    # Resize noise from model input size to original size
+    noise_orig = F.interpolate(
+        noise_model_size.unsqueeze(0),
+        size=(orig_h, orig_w),
+        mode='bilinear', align_corners=False
+    ).squeeze(0)                                    # (3,H,W)
 
-    # create find noise model 
-    noise_model = FindNoise(model, eps,eta).to(device)
-    optimizer = torch.optim.Adam([{'params': noise_model.noise}],lr=lr)
-
-    for k in range(n_iter):
-        compute_loss = 0
-        x.requires_grad = True
-        preds = noise_model(x)
-        query += 1
-        result = attack_success(preds)
-        if result == 0:
-            succ = 1
-            break
-        # compute loss and backward and update eta
-        compute_loss = BCEobj(preds[...,4:5], gt_conf[:,:preds.shape[1],:]) 
-        compute_loss.backward()
-        logger.info('compute_loss {:.6f} '.format(compute_loss.item()))
-        optimizer.step()
-        optimizer.zero_grad()
-        model.zero_grad()
-
-    x_adv = noise_model.get_adv(x)
-    t = time.time() - t_start
-    return x_adv,query,succ,t
-
-def create_gif(demo_save_dir):
-    gt_folder = os.path.join(demo_save_dir,'gt')
-    attack_folder = os.path.join(demo_save_dir,'attack')
-    gt_files = os.listdir(gt_folder)
-    gt_num_list = [int(f) for f in gt_files ]
-    gt_sorted_files = [f for _, f in sorted(zip(gt_num_list, gt_files))]
-    output_folder = os.path.join(demo_save_dir,'gif')
-    os.makedirs(output_folder, exist_ok=True)
-
-    gt_files = os.listdir(gt_folder)
-    attack_files = os.listdir(attack_folder)
+    # Clamp and apply
+    noise_clamped = torch.clamp(noise_orig, -EPS, EPS)
+    adv_t = torch.clamp(img_t + noise_clamped.unsqueeze(0), 0.0, 1.0)
+    adv_np = (adv_t[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+    adv_pil = Image.fromarray(adv_np)
+    return adv_pil, adv_t, img_t
 
 
-    num_list = [int(f.split('.')[0]) for f in attack_files ]
-    sorted_files = [f for _, f in sorted(zip(num_list, attack_files))]
-    frame_duration = 60
-
-    gt_images = []
-    attack_images = []
-    gif_num = 0
-    for idx,dir_idx in enumerate(sorted_files):
-        if idx % 100 == 0 and idx!=0:
-            gt_images = []
-            attack_images = []
-
-        attack_image_path = os.path.join(attack_folder, dir_idx,'image0.jpg')
-        attack_image = Image.open(attack_image_path)
-        attack_images.append(attack_image)
-        gt_image_path = os.path.join(gt_folder, dir_idx,'image0.jpg')
-        gt_image = Image.open(gt_image_path)
-        gt_images.append(gt_image)
-        if idx % 99 == 0 and idx != 0 :
-            gif_num += 1
-            imageio.mimsave(os.path.join(output_folder,f'{gif_num}-gt.gif'), gt_images, duration=frame_duration, loop=0)
-            imageio.mimsave(os.path.join(output_folder,f'{gif_num}-attack.gif'), attack_images, duration=frame_duration, loop=0)
-
-def main():
-    n_iter = args.n_iter
-    epsilon = args.epsilon / 255
-    log_dir = os.path.join('result', 'log', 'cs2')
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = 'cs2-localM_{}-targetM_{}-lr{}-eps{}-iter{}-universal{}.log'.format(
-        args.local_model, args.target_model, args.lr, args.epsilon, args.n_iter, args.use_universal_cloak
-    )
-    # logger
-    with open(os.path.join(log_dir, log_file), 'w') as log:
-        logger.add(os.path.join(log_dir, log_file))
-
-    scenario = 'dust2_' + args.scenario
-    # Dataset 
-    data_loader = load_dataset('cs2_demo', 1, scenario=scenario, demo=True)
-
-    # Local Proxy Model
-    weights_path = 'pretrained_models/{}.pt'.format(args.local_model)
+# ─── MODEL LOADERS ───────────────────────────────────────────
+def load_yolov5n():
+    sys.path.insert(0, os.path.abspath('.'))
     from models.common import DetectMultiBackend, AutoShape
-    model = DetectMultiBackend(weights_path, device=torch.device(device), fuse=True)
-    model = AutoShape(model)
+    weights = os.path.join('pretrained_models','yolov5n.pt')
+    model   = DetectMultiBackend(weights, device=torch.device(DEVICE), fuse=True)
+    model   = AutoShape(model)
+    model.conf    = args.conf
+    model.classes = [0]
+    print("  [YOLOv5n] Loaded.")
+    return model
 
-    # Target Model
-    predict_model = torch.hub.load('./', 'custom', 'pretrained_models/{}.pt'.format(args.target_model), source='local').to(device)
-    predict_model.classes = 0
-    predict_model.conf = 0.4
+def load_nanodet():
+    root = r'C:\Users\tsang\nanodet'
+    sys.path.insert(0, root)
+    from nanodet.util import cfg, load_config, Logger as NL
+    from nanodet.model.arch import build_model
+    from nanodet.util import load_model_weight
+    from nanodet.data.transform import Pipeline
+    load_config(cfg, os.path.join(root,'config','nanodet-plus-m_320.yml'))
+    model = build_model(cfg.model)
+    ckpt  = torch.load(os.path.join(root,'nanodet','nanodet-plus-m_320.pth'),
+                       map_location='cpu')
+    load_model_weight(model, ckpt, NL(0, use_tensorboard=False))
+    model = model.to(DEVICE).eval()
+    pipeline = Pipeline(cfg.data.val.pipeline, cfg.data.val.keep_ratio)
+    print("  [NanoDet-Plus] Loaded.")
+    return model, cfg, pipeline
 
-    # metrics
-    succ_num = .0
-    total_num = .0
-    fps = 0
-    total_time = 0
-    total_ssim = []
-    total_query = []
+def load_rtdetr():
+    from ultralytics import YOLO
+    model = YOLO(r'C:\Users\tsang\RT-DETR\rtdetr-l.pt')
+    print("  [RT-DETR] Loaded.")
+    return model
 
-    # Start
-    logger.info("Attack Begin")
-    if global_noise is not None:
-        logger.info("{}".format(global_noise_path))
+
+# ─── DETECTION (returns boxes list [(x1,y1,x2,y2,conf)]) ─────
+def detect_yolov5(model, adv_pil):
+    adv_np  = np.array(adv_pil)
+    results = model(adv_np, size=MODEL_INPUT)
+    boxes   = []
+    for *xyxy, conf, cls in results.xyxy[0].cpu().tolist():
+        if int(cls) == 0:
+            boxes.append((int(xyxy[0]),int(xyxy[1]),int(xyxy[2]),int(xyxy[3]),conf))
+    return boxes
+
+def detect_nanodet(model, nano_cfg, pipeline, adv_pil):
+    import cv2
+    from nanodet.data.collate import naive_collate
+    from nanodet.data.batch_process import stack_batch_img
+    adv_np  = np.array(adv_pil)
+    img_bgr = cv2.cvtColor(adv_np, cv2.COLOR_RGB2BGR)
+    h, w    = img_bgr.shape[:2]
+    meta = dict(img_info={'id':0,'file_name':None,'height':h,'width':w},
+                raw_img=img_bgr, img=img_bgr)
+    meta = pipeline(None, meta, nano_cfg.data.val.input_size)
+    meta['img'] = torch.from_numpy(meta['img'].transpose(2,0,1)).to(DEVICE)
+    meta = naive_collate([meta])
+    meta['img'] = stack_batch_img(meta['img'], divisible=32)
+    with torch.no_grad():
+        results = model.inference(meta)
+    boxes = []
+    dets  = results[0].get(0, [])
+    for d in dets:
+        if d[-1] >= args.conf:
+            x1,y1,x2,y2 = int(d[0]),int(d[1]),int(d[2]),int(d[3])
+            boxes.append((x1,y1,x2,y2,float(d[-1])))
+    return boxes
+
+def detect_rtdetr(model, adv_pil):
+    adv_np  = np.array(adv_pil)
+    results = model.predict(source=adv_np, conf=args.conf,
+                            classes=[0], verbose=False)
+    boxes = []
+    for box in results[0].boxes:
+        x1,y1,x2,y2 = [int(v) for v in box.xyxy[0].tolist()]
+        boxes.append((x1,y1,x2,y2,float(box.conf[0])))
+    return boxes
+
+
+# ─── DRAW BOUNDING BOXES ─────────────────────────────────────
+def draw_boxes(pil_img, boxes):
+    img   = pil_img.copy()
+    draw  = ImageDraw.Draw(img)
+    for (x1,y1,x2,y2,conf) in boxes:
+        draw.rectangle([x1,y1,x2,y2], outline='red', width=3)
+        draw.text((x1,max(0,y1-15)), f'{conf:.2f}', fill='red')
+    return img
+
+
+# ─── SUMMARY SAVE ────────────────────────────────────────────
+def save_summary(game, model_name, dsr, avg_ssim, avg_fps, n_images):
+    row = {'Game':game.upper(),'Model':model_name,'Images':n_images,
+           'DSR':round(dsr,4),'AvgSSIM':round(avg_ssim,4),'AvgFPS':round(avg_fps,2)}
+    if os.path.exists(EVAL_XLSX):
+        df = pd.read_excel(EVAL_XLSX)
+        df = df[~((df['Game']==row['Game'])&(df['Model']==row['Model']))]
     else:
-        logger.info("No Global Noise")
+        df = pd.DataFrame()
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_excel(EVAL_XLSX, index=False)
+    print(f"  Summary → {EVAL_XLSX}")
+    if len(df) >= 1:
+        labels = [f"{r['Game']}\n{r['Model']}" for _,r in df.iterrows()]
+        dsrs   = df['DSR'].tolist()
+        fig,ax = plt.subplots(figsize=(max(8,len(df)*1.0),5))
+        bars   = ax.bar(labels,[d*100 for d in dsrs],color='steelblue',width=0.55)
+        for bar,val in zip(bars,dsrs):
+            ax.text(bar.get_x()+bar.get_width()/2,
+                    bar.get_height()+1,
+                    f'{val*100:.1f}%',ha='center',va='bottom',fontsize=9)
+        ax.set_ylabel('Defense Success Rate (%)')
+        ax.set_ylim(0,115)
+        ax.set_title('Universal Cloak — DSR per Game × Model')
+        plt.tight_layout()
+        plt.savefig(EVAL_PNG, dpi=150); plt.close()
+        print(f"  Chart  → {EVAL_PNG}")
 
-    logger.info("len dataset {}".format(len(data_loader)))
 
-    len_dataset = len(data_loader)
-    #  Attack
-    total = 0
-    demo_save_dir = os.path.join('result', 'visualization', 'cs2_demo', args.scenario)
-    os.makedirs(demo_save_dir, exist_ok=True)
-    for i, (img_path, _, _) in enumerate(data_loader):
-        img = np.array(Image.open(img_path[0]), np.uint8)
-        img = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
-        imgs = img.to(device, non_blocking=True).float() / 255
+# ─── MAIN ────────────────────────────────────────────────────
+def main():
+    print("\n[1] Loading image paths …")
+    img_paths = load_image_paths(DATA_PATH)
 
-        adv_imgs, k, local_suc, t = tog_vanishing(imgs, model, n_iter=n_iter, eps=epsilon, lr=args.lr)
-        total_time += t
+    print(f"\n[2] Loading model: {MODEL} …")
+    nano_cfg = nano_pipeline = None
+    if MODEL == 'yolov5n':
+        detect_model = load_yolov5n()
+    elif MODEL == 'nanodet':
+        detect_model, nano_cfg, nano_pipeline = load_nanodet()
+    elif MODEL == 'rtdetr':
+        detect_model = load_rtdetr()
 
-        target_succ = 0
-        if 'yolov5' in args.target_model:
-            x = adv_imgs[0].detach().permute(1, 2, 0).cpu() * 255
-            predict_results = predict_model(np.array(x), size=320)
-            result = predict_results.xyxy[0].shape[0]
-            if result == 0:
-                target_succ = 1
-                succ_num += 1.0
-        elif 'yolov8' in args.target_model:
-            attack_results = predict_model.predict(source=adv_imgs, conf=0.4, verbose=False, classes=0)
-            if len(attack_results[0].boxes.conf) == 0:
-                target_succ = 1
-                succ_num += 1.0
+    print(f"\n[3] Evaluating {len(img_paths)} images …")
+    succ_num   = 0
+    total_time = 0.0
+    ssim_vals  = []
+    log_rows   = []
 
-        ssim_val = ssim((imgs * 255).cpu(), (adv_imgs * 255).cpu(), data_range=255, size_average=False)
-        total_ssim.append(ssim_val.item())
-        total_query.append(k)
-        total_num += 1.0
-        fps = total_num / total_time
-        logger.info("Index:{} LSucc:{} TSucc:{} Single_Time:{:.3f} Query:{} SSIM: {:.3f} ".
-                    format(i, local_suc, target_succ, t, k, ssim_val.item()))
-        logger.info("Total:{} DSR:{:.3f} AvgTime:{:.3f} FPS:{:.3f} AvgSSIM: {:.3f} ".
-                    format(len_dataset, succ_num / total_num, total_time / total_num, fps, np.mean(total_ssim)))
+    for i, img_path in enumerate(img_paths):
+        img_pil = Image.open(img_path).convert('RGB')
+        orig_w, orig_h = img_pil.size
 
-        # visualize inter results
-        attack_file_name = os.path.join(demo_save_dir, 'attack', '{}'.format(i))
-        attack_x = adv_imgs[0].detach().permute(1, 2, 0).cpu() * 255
-        attack_results = predict_model(np.array(attack_x), size=320)
-        attack_results.save(labels=True, save_dir=attack_file_name, exist_ok=True)
-        clean_file_name = os.path.join(demo_save_dir, 'gt', '{}'.format(i))
-        clean_x = imgs[0].detach().permute(1, 2, 0).cpu() * 255
-        clean_results = predict_model(np.array(clean_x), size=320)
-        clean_results.save(labels=True, save_dir=clean_file_name, exist_ok=True)
+        t_start = time.time()
 
-    if args.visualize_gif == 1:
-        logger.info("Creating Gif every 100 frames")
-        create_gif(demo_save_dir)
+        # Apply noise at original size
+        adv_pil, adv_t, img_t = apply_noise_original(img_pil)
 
-if __name__ == "__main__":
+        # Detect on adversarial image
+        if MODEL == 'yolov5n':
+            boxes = detect_yolov5(detect_model, adv_pil)
+        elif MODEL == 'nanodet':
+            boxes = detect_nanodet(detect_model, nano_cfg, nano_pipeline, adv_pil)
+        elif MODEL == 'rtdetr':
+            boxes = detect_rtdetr(detect_model, adv_pil)
+
+        t_elapsed  = time.time() - t_start
+        total_time += t_elapsed
+
+        target_succ = 1 if len(boxes) == 0 else 0
+        succ_num   += target_succ
+
+        # SSIM (compare original vs adversarial at original size)
+        ssim_val = ssim_fn(
+            (img_t*255).cpu(), (adv_t*255).cpu(),
+            data_range=255, size_average=False
+        ).item()
+        ssim_vals.append(ssim_val)
+
+        fps     = (i+1) / total_time
+        dsr_now = succ_num / (i+1)
+
+        print(f"  [{i+1:3d}/{len(img_paths)}] "
+              f"Dets:{len(boxes)} TSucc:{target_succ} "
+              f"DSR:{dsr_now:.3f} SSIM:{ssim_val:.3f} "
+              f"FPS:{fps:.1f}")
+
+        # Save attack image with bounding boxes (original size)
+        adv_with_boxes = draw_boxes(adv_pil, boxes)
+        fname = os.path.splitext(os.path.basename(img_path))[0]
+        adv_with_boxes.save(os.path.join(ATTACK_DIR, f'{fname}_attack.jpg'))
+
+        log_rows.append({
+            'Index':   i,
+            'File':    os.path.basename(img_path),
+            'TSucc':   target_succ,
+            'Dets':    len(boxes),
+            'DSR':     round(dsr_now,4),
+            'SSIM':    round(ssim_val,4),
+            'Time_s':  round(t_elapsed,4),
+            'FPS':     round(fps,2),
+        })
+
+    # Save per-image log
+    log_path = os.path.join(LOG_DIR, f'{GAME}_{MODEL}_eval.xlsx')
+    pd.DataFrame(log_rows).to_excel(log_path, index=False)
+    print(f"\n  Log → {log_path}")
+
+    final_dsr  = succ_num / len(img_paths)
+    final_ssim = np.mean(ssim_vals)
+    final_fps  = len(img_paths) / total_time
+
+    print(f"\n{'='*55}")
+    print(f"  RESULTS : {GAME.upper()} / {MODEL}")
+    print(f"  DSR     : {final_dsr:.4f} ({final_dsr*100:.1f}%)")
+    print(f"  AvgSSIM : {final_ssim:.4f}")
+    print(f"  AvgFPS  : {final_fps:.2f}")
+    print(f"{'='*55}\n")
+
+    save_summary(GAME, MODEL, final_dsr, final_ssim, final_fps, len(img_paths))
+
+if __name__ == '__main__':
     main()
