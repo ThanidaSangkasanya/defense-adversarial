@@ -35,6 +35,10 @@
 *.dmg
 *.bin
 
+# ===== โฟลเดอร์ผลลัพธ์ (ไม่ต้องขึ้น repo) =====
+result/
+universal_cloak/
+
 # ===== ไฟล์ชั่วคราว / ระบบ =====
 .DS_Store
 Thumbs.db
