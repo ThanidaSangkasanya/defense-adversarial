@@ -15,7 +15,7 @@ parser.add_argument('--game',      required=True,  type=str,
                     choices=['cs2','cf','valorant','overwatch'])
 parser.add_argument('--model',     required=True,  type=str,
                     choices=['yolov5n','nanodet','rtdetr'])
-parser.add_argument('--n_iter',    default=300,    type=int)
+parser.add_argument('--n_iter',    default=100,    type=int)
 parser.add_argument('--lr',        default=0.0005, type=float)
 parser.add_argument('--epsilon',   default=8,      type=int)
 parser.add_argument('--gpu',       default='0',    type=str)
@@ -33,7 +33,7 @@ GAME_FOLDER = {'cs2':'CS2','cf':'CF','valorant':'Valorant','overwatch':'Overwatc
 DATA_PATH   = os.path.join(r'C:\Users\tsang\Dataset', GAME_FOLDER[GAME])
 
 # Model input sizes
-MODEL_SIZE  = {'yolov5n': 416, 'nanodet': 320, 'rtdetr': 640}
+MODEL_SIZE  = {'yolov5n': 320, 'nanodet': 320, 'rtdetr': 640}
 MODEL_INPUT = MODEL_SIZE[MODEL]
 
 NOISE_OUT_DIR   = os.path.join('universal_cloak', GAME, MODEL)

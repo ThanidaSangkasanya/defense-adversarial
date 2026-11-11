@@ -1,0 +1,45 @@
+# ===== รูปภาพ (ไม่ต้องอัพขึ้น repo) =====
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.ico
+*.svg
+*.heic
+*.heif
+*.raw
+
+# ===== ไฟล์ภาพ/วิดีโอ/เสียง ขนาดใหญ่ =====
+*.psd
+*.ai
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.flac
+
+# ===== ไฟล์บีบอัด / ไฟล์ใหญ่ทั่วไป =====
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.iso
+*.dmg
+*.bin
+
+# ===== ไฟล์ชั่วคราว / ระบบ =====
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+node_modules/
+__pycache__/
+.env
